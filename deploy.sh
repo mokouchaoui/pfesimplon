@@ -7,6 +7,10 @@
 # ============================================================
 set -euo pipefail
 
+# Make Windows-installed tools visible inside Git Bash
+export PATH="/c/Program Files/Amazon/AWSCLIV2:/c/ProgramData/chocolatey/bin:/c/Program Files/Docker/Docker/resources/bin:$PATH"
+
+
 REGION="us-east-1"
 ACCOUNT="149146127959"
 CLUSTER="helpdesk-eks"

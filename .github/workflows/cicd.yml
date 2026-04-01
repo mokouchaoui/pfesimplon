@@ -1,10 +1,28 @@
+# =============================================================================
+# .github/workflows/cicd.yml
+# -----------------------------------------------------------------------------
+# Automated CI/CD pipeline — triggered on every push to the main branch.
+# No GitHub Secrets needed — AWS authentication uses OIDC (short-lived tokens).
+#
+# Pipeline has 2 jobs:
+#   1. build-and-push  — builds 3 Docker images and pushes them to ECR
+#   2. deploy-eks      — deploys the new images to the EKS cluster
+#
+# OIDC flow (no static keys):
+#   GitHub generates a JWT token for this workflow run.
+#   AWS IAM role "helpdesk-github-actions" trusts tokens from this repo.
+#   The role grants only the minimum permissions: ECR push, EKS describe, SQS.
+# =============================================================================
+
 name: ci-cd
 
 on:
   push:
-    branches: ["main"]
-  pull_request:
+    branches: ["main"]   # Run on every push to main
+  pull_request:           # Also run on PRs (build only, deploy is skipped for non-main)
 
+# All hardcoded values — no GitHub Secrets needed.
+# These are resource identifiers, not credentials — safe to commit.
 env:
   AWS_REGION:   us-east-1
   AWS_ACCOUNT:  "149146127959"
@@ -16,27 +34,38 @@ env:
   CLUSTER_NAME: helpdesk-eks
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build Docker images and push to ECR
+  # ---------------------------------------------------------------------------
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
-      contents: read
+      id-token: write   # Required to generate the OIDC JWT token
+      contents: read    # Required to checkout the repository
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4  # Checkout source code
 
+      # Authenticate to AWS using OIDC — no access keys stored anywhere.
+      # GitHub sends a JWT; AWS verifies it against the OIDC provider and returns
+      # temporary credentials scoped to the helpdesk-github-actions role.
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.ROLE_ARN }}
 
+      # Login to ECR so Docker can push to our private registry
       - uses: aws-actions/amazon-ecr-login@v2
 
+      # Build and push backend image.
+      # Tagged with both the Git commit SHA (traceability) and "latest" (convenience).
+      # The SHA tag is what gets deployed — ensures exact version traceability.
       - name: Build & push backend
         run: |
           docker build -t $ECR_BACKEND:$GITHUB_SHA -t $ECR_BACKEND:latest ./backend
           docker push $ECR_BACKEND:$GITHUB_SHA
           docker push $ECR_BACKEND:latest
 
+      # Worker uses the same Dockerfile as backend but different runtime CMD
       - name: Build & push worker
         run: |
           docker build -t $ECR_WORKER:$GITHUB_SHA -t $ECR_WORKER:latest ./backend
@@ -49,10 +78,14 @@ jobs:
           docker push $ECR_FRONTEND:$GITHUB_SHA
           docker push $ECR_FRONTEND:latest
 
+  # ---------------------------------------------------------------------------
+  # Job 2: Deploy to EKS
+  # Only runs on pushes to main (not PRs) and only after build-and-push succeeds.
+  # ---------------------------------------------------------------------------
   deploy-eks:
     runs-on: ubuntu-latest
-    needs: build-and-push
-    if: github.ref == 'refs/heads/main'
+    needs: build-and-push  # Wait for images to be pushed before deploying
+    if: github.ref == 'refs/heads/main'  # Skip deployment for PRs
     permissions:
       id-token: write
       contents: read
@@ -64,9 +97,13 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.ROLE_ARN }}
 
+      # Download cluster credentials into ~/.kube/config so kubectl works
       - name: Configure kubectl
         run: aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
 
+      # Create or update the Kubernetes Secret containing the SQS URL.
+      # --dry-run=client -o yaml | kubectl apply — idempotent pattern:
+      # creates the secret if it doesn't exist, updates it if it does.
       - name: Sync SQS secret to Kubernetes
         run: |
           kubectl create secret generic app-secret \
@@ -74,6 +111,8 @@ jobs:
             --from-literal=SQS_QUEUE_URL=$SQS_QUEUE_URL \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      # Substitute image placeholders in helpdesk.yaml with real ECR URLs.
+      # Uses the commit SHA tag so every deploy is traceable to a specific commit.
       - name: Deploy
         run: |
           sed -e "s|REPLACE_WITH_BACKEND_IMAGE|$ECR_BACKEND:$GITHUB_SHA|g" \
@@ -81,10 +120,14 @@ jobs:
               -e "s|REPLACE_WITH_FRONTEND_IMAGE|$ECR_FRONTEND:$GITHUB_SHA|g" \
               k8s/helpdesk.yaml | kubectl apply -f -
 
+      # Block until all pods are healthy.
+      # If a new pod crashes (e.g. bad image), this step fails and the pipeline
+      # is marked red — giving early warning before the broken version serves traffic.
       - name: Wait for rollout
         run: |
           kubectl rollout status deployment/backend  -n helpdesk --timeout=180s
           kubectl rollout status deployment/frontend -n helpdesk --timeout=180s
 
+      # Print the public LoadBalancer URL at the end of every deploy
       - name: Print app URL
         run: kubectl get svc frontend -n helpdesk

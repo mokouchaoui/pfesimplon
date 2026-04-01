@@ -1,4 +1,11 @@
-flask==3.0.3
-flask-cors==4.0.1
-boto3==1.35.36
-gunicorn==23.0.0
+# =============================================================================
+# backend/requirements.txt
+# -----------------------------------------------------------------------------
+# Pinned Python dependencies for reproducible builds.
+# Versions are locked to avoid unexpected breaking changes across environments.
+# =============================================================================
+
+flask==3.0.3        # Web framework — handles HTTP routing and JSON responses
+flask-cors==4.0.1   # Adds CORS headers so browsers allow cross-origin requests
+boto3==1.35.36      # AWS SDK — used to send messages to SQS and call AWS APIs
+gunicorn==23.0.0    # Production WSGI server — replaces Flask's built-in dev server

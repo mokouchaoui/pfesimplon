@@ -1,17 +1,49 @@
+# =============================================================================
+# k8s/helpdesk.yaml
+# -----------------------------------------------------------------------------
+# Single Kubernetes manifest file that defines the ENTIRE application.
+# Applied with: kubectl apply -f k8s/helpdesk.yaml
+# In CI/CD, the REPLACE_WITH_*_IMAGE placeholders are substituted with
+# real ECR URLs using sed before applying.
+#
+# Resources defined:
+#   Namespace       - isolates our app from other workloads
+#   ConfigMap       - non-sensitive configuration (URLs, region)
+#   Secret          - sensitive configuration (SQS queue URL)
+#   Deployment x3  - backend (Flask), worker (SQS consumer), frontend (Next.js)
+#   Service x2     - backend (ClusterIP, internal only), frontend (LoadBalancer, public)
+#   HPA            - auto-scales backend pods based on CPU usage
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Namespace: isolates all helpdesk resources from other k8s workloads.
+# Good practice: each app gets its own namespace.
+# ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Namespace
 metadata:
   name: helpdesk
 ---
+# ---------------------------------------------------------------------------
+# ConfigMap: stores non-sensitive configuration as key-value pairs.
+# Injected into pods as environment variables.
+# BACKEND_URL uses Kubernetes internal DNS: "backend" resolves to the
+# ClusterIP of the backend Service \u2014 only works inside the cluster.
+# ---------------------------------------------------------------------------
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: app-config
   namespace: helpdesk
 data:
-  BACKEND_URL: http://backend:5000
+  BACKEND_URL: http://backend:5000  # Internal cluster DNS \u2014 not reachable from browser
   AWS_REGION: us-east-1
 ---
+# ---------------------------------------------------------------------------
+# Secret: stores sensitive configuration.
+# Unlike ConfigMap, Secrets are base64-encoded and can be encrypted at rest.
+# The SQS_QUEUE_URL is populated by the CI/CD pipeline before each deploy.
+# ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Secret
 metadata:
@@ -19,18 +51,24 @@ metadata:
   namespace: helpdesk
 type: Opaque
 stringData:
-  SQS_QUEUE_URL: ""
+  SQS_QUEUE_URL: ""  # Filled in by: kubectl create secret --from-literal=SQS_QUEUE_URL=...
 ---
+# ---------------------------------------------------------------------------
+# Backend Deployment: runs the Flask REST API.
+# 2 replicas for high availability \u2014 if one pod crashes, the other keeps serving.
+# Kubernetes uses a rolling update strategy by default: new pods are started
+# before old ones are stopped, so there is zero downtime during deploys.
+# ---------------------------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend
   namespace: helpdesk
 spec:
-  replicas: 2
+  replicas: 2  # 2 pods spread across 2 nodes (one per AZ)
   selector:
     matchLabels:
-      app: backend
+      app: backend  # Links this Deployment to pods with label app=backend
   template:
     metadata:
       labels:
@@ -38,7 +76,7 @@ spec:
     spec:
       containers:
         - name: backend
-          image: REPLACE_WITH_BACKEND_IMAGE
+          image: REPLACE_WITH_BACKEND_IMAGE  # Substituted by CI/CD with ECR URL + commit SHA
           ports:
             - containerPort: 5000
           env:
@@ -46,34 +84,47 @@ spec:
               value: "5000"
             - name: AWS_REGION
               valueFrom:
-                configMapKeyRef:
+                configMapKeyRef:   # Read from ConfigMap (non-sensitive)
                   name: app-config
                   key: AWS_REGION
             - name: SQS_QUEUE_URL
               valueFrom:
-                secretKeyRef:
+                secretKeyRef:      # Read from Secret (sensitive)
                   name: app-secret
                   key: SQS_QUEUE_URL
 ---
+# ---------------------------------------------------------------------------
+# Backend Service (ClusterIP): exposes the backend pods internally.
+# ClusterIP = no external IP. Only reachable from within the cluster.
+# This is the security boundary: the backend is never exposed to the internet.
+# The frontend proxy accesses it via http://backend:5000.
+# ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
-  name: backend
+  name: backend  # This name becomes the DNS hostname inside the cluster
   namespace: helpdesk
 spec:
   selector:
-    app: backend
+    app: backend  # Routes traffic to pods with label app=backend
   ports:
-    - port: 5000
-      targetPort: 5000
+    - port: 5000       # Port the Service listens on
+      targetPort: 5000 # Port on the pod to forward to
 ---
+# ---------------------------------------------------------------------------
+# Worker Deployment: runs the SQS consumer.
+# Uses the SAME Docker image as the backend but overrides the CMD:
+#   Backend default: gunicorn -b 0.0.0.0:5000 app:app
+#   Worker override: python worker.py
+# Only 1 replica needed \u2014 SQS handles buffering if the worker is slow.
+# ---------------------------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: worker
   namespace: helpdesk
 spec:
-  replicas: 1
+  replicas: 1  # One consumer is enough for this demo
   selector:
     matchLabels:
       app: worker
@@ -84,8 +135,8 @@ spec:
     spec:
       containers:
         - name: worker
-          image: REPLACE_WITH_WORKER_IMAGE
-          command: ["python", "worker.py"]
+          image: REPLACE_WITH_WORKER_IMAGE  # Same image as backend
+          command: ["python", "worker.py"]  # Override default CMD to run the worker
           env:
             - name: AWS_REGION
               valueFrom:
@@ -98,6 +149,11 @@ spec:
                   name: app-secret
                   key: SQS_QUEUE_URL
 ---
+# ---------------------------------------------------------------------------
+# Frontend Deployment: runs the Next.js application.
+# 2 replicas for availability. The frontend reads BACKEND_URL at runtime
+# (server-side) to know where to proxy API requests.
+# ---------------------------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -123,21 +179,33 @@ spec:
               valueFrom:
                 configMapKeyRef:
                   name: app-config
-                  key: BACKEND_URL
+                  key: BACKEND_URL  # http://backend:5000 \u2014 used by the API proxy route
 ---
+# ---------------------------------------------------------------------------
+# Frontend Service (LoadBalancer): the ONLY public-facing resource.
+# AWS automatically creates an Elastic Load Balancer with a public DNS name.
+# Internet traffic: port 80 \u2192 ELB \u2192 frontend pod port 3000
+# The ELB URL is what users open in their browser.
+# ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
   name: frontend
   namespace: helpdesk
 spec:
-  type: LoadBalancer
+  type: LoadBalancer  # Triggers AWS ELB creation automatically
   selector:
     app: frontend
   ports:
-    - port: 80
-      targetPort: 3000
+    - port: 80        # Public-facing port (standard HTTP)
+      targetPort: 3000 # Forward to Next.js port inside the pod
 ---
+# ---------------------------------------------------------------------------
+# HorizontalPodAutoscaler: auto-scales the backend based on CPU.
+# When average CPU across all backend pods exceeds 70%, Kubernetes adds more pods.
+# When load decreases, it scales back down to minReplicas.
+# Demonstrates cloud-native elasticity \u2014 the app adapts to traffic automatically.
+# ---------------------------------------------------------------------------
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -148,12 +216,12 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: backend
-  minReplicas: 2
-  maxReplicas: 5
+  minReplicas: 2  # Always keep at least 2 for high availability
+  maxReplicas: 5  # Never exceed 5 (cost control)
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 70
+          averageUtilization: 70  # Scale out when average CPU > 70%

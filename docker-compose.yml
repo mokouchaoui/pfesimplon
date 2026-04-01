@@ -1,19 +1,43 @@
+# =============================================================================
+# docker-compose.yml
+# -----------------------------------------------------------------------------
+# Local development environment \u2014 runs the full stack on your laptop.
+# Start everything with: docker compose up --build
+# Stop with: docker compose down
+#
+# This mirrors the Kubernetes production setup but without AWS services.
+# SQS_QUEUE_URL is left empty so the backend/worker skip SQS gracefully.
+# The worker runs in idle mode when SQS_QUEUE_URL is not set.
+# =============================================================================
+
 version: "3.9"
 services:
+  # ---------------------------------------------------------------------------
+  # Backend: Flask REST API
+  # Builds from ./backend/Dockerfile using gunicorn (default CMD)
+  # Accessible at http://localhost:5000
+  # ---------------------------------------------------------------------------
   backend:
     build: ./backend
     ports:
-      - "5000:5000"
+      - "5000:5000"  # host:container \u2014 exposes Flask on localhost:5000
     environment:
       - PORT=5000
       - AWS_REGION=us-east-1
-      - SQS_QUEUE_URL=
+      - SQS_QUEUE_URL=  # Empty = SQS disabled locally, worker runs in idle mode
 
+  # ---------------------------------------------------------------------------
+  # Frontend: Next.js application
+  # Builds from ./frontend/Dockerfile using multi-stage build
+  # Accessible at http://localhost:3000
+  # BACKEND_URL uses Docker Compose service DNS \u2014 "backend" resolves to the
+  # backend container's IP, same concept as Kubernetes ClusterIP DNS.
+  # ---------------------------------------------------------------------------
   frontend:
     build: ./frontend
     ports:
-      - "3000:3000"
+      - "3000:3000"  # host:container \u2014 exposes Next.js on localhost:3000
     environment:
-      - BACKEND_URL=http://backend:5000
+      - BACKEND_URL=http://backend:5000  # Docker internal DNS (same as k8s)
     depends_on:
-      - backend
+      - backend  # Wait for backend container to start before starting frontend
