@@ -1,0 +1,90 @@
+name: ci-cd
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  AWS_REGION:   us-east-1
+  AWS_ACCOUNT:  "149146127959"
+  ROLE_ARN:     arn:aws:iam::149146127959:role/helpdesk-github-actions
+  ECR_BACKEND:  149146127959.dkr.ecr.us-east-1.amazonaws.com/helpdesk-backend
+  ECR_WORKER:   149146127959.dkr.ecr.us-east-1.amazonaws.com/helpdesk-worker
+  ECR_FRONTEND: 149146127959.dkr.ecr.us-east-1.amazonaws.com/helpdesk-frontend
+  SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/149146127959/helpdesk-events
+  CLUSTER_NAME: helpdesk-eks
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push backend
+        run: |
+          docker build -t $ECR_BACKEND:$GITHUB_SHA -t $ECR_BACKEND:latest ./backend
+          docker push $ECR_BACKEND:$GITHUB_SHA
+          docker push $ECR_BACKEND:latest
+
+      - name: Build & push worker
+        run: |
+          docker build -t $ECR_WORKER:$GITHUB_SHA -t $ECR_WORKER:latest ./backend
+          docker push $ECR_WORKER:$GITHUB_SHA
+          docker push $ECR_WORKER:latest
+
+      - name: Build & push frontend
+        run: |
+          docker build -t $ECR_FRONTEND:$GITHUB_SHA -t $ECR_FRONTEND:latest ./frontend
+          docker push $ECR_FRONTEND:$GITHUB_SHA
+          docker push $ECR_FRONTEND:latest
+
+  deploy-eks:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
+
+      - name: Sync SQS secret to Kubernetes
+        run: |
+          kubectl create secret generic app-secret \
+            --namespace helpdesk \
+            --from-literal=SQS_QUEUE_URL=$SQS_QUEUE_URL \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy
+        run: |
+          sed -e "s|REPLACE_WITH_BACKEND_IMAGE|$ECR_BACKEND:$GITHUB_SHA|g" \
+              -e "s|REPLACE_WITH_WORKER_IMAGE|$ECR_WORKER:$GITHUB_SHA|g" \
+              -e "s|REPLACE_WITH_FRONTEND_IMAGE|$ECR_FRONTEND:$GITHUB_SHA|g" \
+              k8s/helpdesk.yaml | kubectl apply -f -
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/backend  -n helpdesk --timeout=180s
+          kubectl rollout status deployment/frontend -n helpdesk --timeout=180s
+
+      - name: Print app URL
+        run: kubectl get svc frontend -n helpdesk

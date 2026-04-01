@@ -1,0 +1,159 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: helpdesk
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: helpdesk
+data:
+  BACKEND_URL: http://backend:5000
+  AWS_REGION: us-east-1
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secret
+  namespace: helpdesk
+type: Opaque
+stringData:
+  SQS_QUEUE_URL: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: helpdesk
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: REPLACE_WITH_BACKEND_IMAGE
+          ports:
+            - containerPort: 5000
+          env:
+            - name: PORT
+              value: "5000"
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: AWS_REGION
+            - name: SQS_QUEUE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-secret
+                  key: SQS_QUEUE_URL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: helpdesk
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: helpdesk
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: REPLACE_WITH_WORKER_IMAGE
+          command: ["python", "worker.py"]
+          env:
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: AWS_REGION
+            - name: SQS_QUEUE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-secret
+                  key: SQS_QUEUE_URL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: helpdesk
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: REPLACE_WITH_FRONTEND_IMAGE
+          ports:
+            - containerPort: 3000
+          env:
+            - name: BACKEND_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: BACKEND_URL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: helpdesk
+spec:
+  type: LoadBalancer
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 3000
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: helpdesk
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
